@@ -26,14 +26,42 @@ const PARALLEL_CALLS =
 // on every agent start so compaction cannot drop them.
 // A child gets the sheet, as a Claude Code subagent sees CLAUDE.md, but not
 // the mandate: SessionStart does not run for subagents.
+// pi (upstream) carries systemPromptOptions.sections; omp's event does not.
+function piSections(event: unknown): Record<string, string> | undefined {
+  if (!(event && typeof event === "object" && "systemPromptOptions" in event)) return;
+  const opts = event.systemPromptOptions;
+  if (!(opts && typeof opts === "object" && "sections" in opts)) return;
+  const sections = opts.sections;
+  if (!(sections && typeof sections === "object" && !Array.isArray(sections))) return;
+  return sections as Record<string, string>;
+}
+
+// omp and pi disagree on BeforeAgentStartEvent shape, so type the handler locally and cast once at the boundary.
+type OnBeforeAgentStart = (
+  handler: (event: { prompt: string; systemPrompt?: string[] }) => { systemPrompt?: string[] } | void,
+) => void;
+
 export function registerPromptSections(pi: ExtensionAPI, settings: Settings): void {
   const mandateFile = join(settings.pluginRoot, "hooks", "session-start-context.md");
-  pi.on("before_agent_start", (event) => {
+  // Cast needed only because omp/pi event shapes differ; the runtime handler below fits both.
+  const onBeforeAgentStart = ((handler: Parameters<OnBeforeAgentStart>[0]) =>
+    pi.on("before_agent_start", handler as never)) as OnBeforeAgentStart;
+  onBeforeAgentStart((event) => {
     const sheet = readSheet(settings.agentDir);
-    const sections = event.systemPromptOptions.sections;
-    sections[PARALLEL_SECTION] = PARALLEL_CALLS;
-    sections[TOOLS_SECTION] = piToolsNote(settings.pluginRoot);
-    if (settings.depth === 0 && !sheet?.hookOff) sections[MANDATE_SECTION] = readFileSync(mandateFile, "utf8");
-    if (sheet) sections[SHEET_SECTION] = sheet.text;
+    const parts: [string, string][] = [[TOOLS_SECTION, piToolsNote(settings.pluginRoot)]];
+    if (settings.depth === 0 && !sheet?.hookOff) parts.push([MANDATE_SECTION, readFileSync(mandateFile, "utf8")]);
+    if (sheet) parts.push([SHEET_SECTION, sheet.text]);
+
+    // pi (upstream): mutate the structured sections record.
+    const sections = piSections(event);
+    if (sections) {
+      sections[PARALLEL_SECTION] = PARALLEL_CALLS;
+      for (const [key, text] of parts) sections[key] = text;
+      return;
+    }
+    // omp: event.systemPrompt is a string[]; returning systemPrompt replaces it (chained across extensions).
+    const base = event.systemPrompt ?? [];
+    const seen = new Set(base);
+    return { systemPrompt: [...base, ...[PARALLEL_CALLS, ...parts.map(([, text]) => text)].filter((p) => !seen.has(p))] };
   });
 }
